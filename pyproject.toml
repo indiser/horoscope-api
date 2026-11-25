@@ -1,0 +1,12 @@
+[project]
+name = "horoscope-api"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi>=0.165.0",
+    "scrapling[all]>=0.5.1",
+    "tzdata>=2026.6",
+    "uvicorn>=0.54.0",
+]
