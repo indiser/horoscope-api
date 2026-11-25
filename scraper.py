@@ -1,29 +1,26 @@
-import os, sqlite3, json, re, logging
+import os, json, re, logging, sys, time, random
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from scrapling import StealthyFetcher
-import sys
 
 log = logging.getLogger("scraper")
 IST = ZoneInfo("Asia/Kolkata")
 BASE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 os.makedirs(BASE, exist_ok=True)
 ADAPTIVE_DB = os.path.join(BASE, "adaptive_storage.db")
-STORE_DB = os.path.join(BASE, "horoscope.db")
 
 StealthyFetcher.configure(adaptive=True, storage_args={"storage_file": ADAPTIVE_DB})
 
 SIGNS = ["aries","taurus","gemini","cancer","leo","virgo","libra",
          "scorpio","sagittarius","capricorn","aquarius","pisces"]
 
+RETRY_WAIT = 120            # seconds wait after bad fetch
+MAX_TRIES = 5               # per page
+PAGE_DELAY = (3, 6)         # polite random delay after good page
+MAX_CONSEC_FAILS = 2        # abort run after N signs fail in a row
+
 def today_ist() -> str:
     return datetime.now(IST).date().isoformat()
-
-def db():
-    c = sqlite3.connect(STORE_DB, timeout=30)
-    c.execute("PRAGMA journal_mode=WAL")
-    c.execute("CREATE TABLE IF NOT EXISTS horoscope(sign TEXT, day TEXT, data TEXT, PRIMARY KEY(sign, day))")
-    return c
 
 # sanity validators: catch wrong-element matches
 VALID = {
@@ -54,12 +51,23 @@ def extract(res, xpath, sign, field):
     return text
 
 def fetch(url):
-    res = StealthyFetcher.fetch(url=url, block_ads=True, solve_cloudflare=True, timeout=60000)
-    if res.status != 200:
-        raise RuntimeError(f"{url} status {res.status}")
-    return res
+    for attempt in range(1, MAX_TRIES + 1):
+        try:
+            res = StealthyFetcher.fetch(
+                url=url, block_ads=True, solve_cloudflare=True, timeout=60000
+            )
+            if res.status == 200:
+                time.sleep(random.uniform(*PAGE_DELAY))
+                return res
+            reason = f"status {res.status}"
+        except Exception as e:
+            reason = f"{type(e).__name__}: {e}"
+        if attempt == MAX_TRIES:
+            raise RuntimeError(f"{url} failed after {MAX_TRIES} tries: {reason}")
+        log.warning("%s %s, try %d/%d, wait %ds", url, reason, attempt, MAX_TRIES, RETRY_WAIT)
+        time.sleep(RETRY_WAIT)
 
-def scrape_sign(sign):
+def scrape_sign(sign, day):
     u = lambda kind: f"https://astrotalk.com/horoscope/{kind}/{sign}"
     main = fetch(u("daily-horoscope"))
     love = fetch(u("daily-love-horoscope"))
@@ -70,7 +78,7 @@ def scrape_sign(sign):
     g = "/html/body/div[3]/div/main/div/div[4]/div[1]/div/div[1]/div[3]/div/div/div"
     sub_p = "/html/body/div[3]/div/main/div/div[4]/div[1]/div[1]/p"
     d = {
-        "sign": sign, "date": today_ist(),
+        "sign": sign, "date": day,
         "horoscope": extract(main, "/html/body/div[3]/div/main/div/div[4]/div[1]/div/div[1]/p", sign, "horoscope"),
         "lucky_number": extract(main, f"{g}/div[2]/div[2]", sign, "lucky_number"),
         "auspicious_time_ist": extract(main, f"{g}/div[3]/div[2]", sign, "auspicious_time_ist"),
@@ -89,22 +97,40 @@ def scrape_sign(sign):
         raise RuntimeError(f"{sign} missing {missing}")   # never store partial
     return d
 
+def sign_path(sign):
+    return os.path.join(BASE, f"{sign}.json")
+
+def is_done(sign, day) -> bool:
+    try:
+        with open(sign_path(sign), encoding="utf-8") as f:
+            return json.load(f).get("date") == day
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False
+
+def save(sign, d):
+    tmp = sign_path(sign) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=4)
+    os.replace(tmp, sign_path(sign))   # atomic, no half-file on crash
+
 def run() -> int:
     day = today_ist()
-    c = db()
-    failed = []
+    consec = 0
     for sign in SIGNS:
+        if is_done(sign, day):
+            log.info("skip %s, done for %s", sign, day)
+            continue
         try:
-            d = scrape_sign(sign)
-            c.execute("INSERT OR REPLACE INTO horoscope VALUES(?,?,?)", (sign, day, json.dumps(d)))
-            c.commit()
+            save(sign, scrape_sign(sign, day))
+            log.info("saved %s", sign)
+            consec = 0
         except Exception:
             log.exception("scrape failed %s", sign)
-            failed.append(sign)
-    c.execute("DELETE FROM horoscope WHERE day < date(?, '-7 day')", (day,))
-    c.commit()
-    c.close()
-    return len(failed)
+            consec += 1
+            if consec >= MAX_CONSEC_FAILS:
+                log.error("%d signs failed in a row, site likely down, abort", consec)
+                break
+    return sum(1 for s in SIGNS if not is_done(s, day))
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)

@@ -1,6 +1,6 @@
 # 🔮 Horoscope API
 
-A lightweight REST API that serves daily horoscope data for all 12 zodiac signs. It scrapes [AstroTalk](https://astrotalk.com) using a stealth browser fetcher with adaptive XPath learning, stores results in SQLite, and exposes them via FastAPI.
+A lightweight REST API that serves daily horoscope data for all 12 zodiac signs. It scrapes [AstroTalk](https://astrotalk.com) using a stealth browser fetcher with adaptive XPath learning, stores results as flat JSON files, and exposes them via FastAPI.
 
 ---
 
@@ -10,9 +10,13 @@ A lightweight REST API that serves daily horoscope data for all 12 zodiac signs.
 - Rich per-sign payload: general reading, love, finance, career, health, lucky number, auspicious time, mood, tarot card, lucky stone, ruling planets & symbol
 - Adaptive XPath scraping — learns and self-corrects element selectors over time
 - Cloudflare bypass & ad-blocking via `scrapling`
+- Resilient fetcher — up to 5 retries per page with 120s back-off between attempts
+- Polite scraping — random 3–6s delay between page fetches
+- Circuit breaker — aborts the run if 2 signs fail consecutively (site likely down)
+- Idempotent runs — skips signs already scraped for today
+- Atomic file writes — `.tmp` swap prevents half-written data on crash
 - IST-aware date handling
 - Stale-data flag in responses so consumers know if today's data is ready
-- WAL-mode SQLite with automatic 7-day data retention
 
 ---
 
@@ -21,9 +25,9 @@ A lightweight REST API that serves daily horoscope data for all 12 zodiac signs.
 ```
 Horoscope-API/
 ├── main.py          # FastAPI app & route definitions
-├── scraper.py       # Scraping logic, DB helpers, data validation
+├── scraper.py       # Scraping logic, retry/resilience, data validation
 ├── data/
-│   ├── horoscope.db         # Scraped horoscope storage
+│   ├── {sign}.json          # One JSON file per zodiac sign
 │   └── adaptive_storage.db  # Scrapling adaptive XPath cache
 ├── requirements.txt
 └── pyproject.toml
@@ -48,11 +52,13 @@ uv sync
 pip install -r requirements.txt
 ```
 
-### Run the scraper (populate the DB)
+### Run the scraper (populate the data files)
 
 ```bash
 python scraper.py
 ```
+
+The scraper exits with code `0` if all 12 signs were scraped successfully, or `1` if any sign is missing data for today.
 
 ### Start the API server
 
@@ -110,7 +116,7 @@ GET /horoscope/aries
 | Status | Meaning |
 |---|---|
 | `422` | Invalid zodiac sign |
-| `503` | Scraper hasn't run yet / no data available |
+| `503` | Scraper hasn't run yet / no data file found |
 
 ---
 
@@ -119,15 +125,31 @@ GET /horoscope/aries
 ```
 scraper.py runs (cron / manual)
     │
+    ├── Skips signs already scraped for today (idempotent)
     ├── Fetches 5 pages per sign (general, love, finance, career, health)
+    │     └── Retries up to 5× per page with 120s back-off on failure
     ├── Extracts fields via adaptive XPath (learns correct selectors over time)
     ├── Validates each field (length checks, digit presence, etc.)
     ├── Rejects partial results — all required fields must pass validation
-    └── Stores JSON payload in SQLite (sign + date as primary key)
+    ├── Writes result atomically to data/{sign}.json via .tmp swap
+    └── Aborts early if 2 consecutive signs fail (circuit breaker)
 
 main.py (FastAPI)
-    └── GET /horoscope/{sign} → reads latest row from DB, flags if stale
+    └── GET /horoscope/{sign} → reads data/{sign}.json, flags if stale
 ```
+
+---
+
+## 🛡️ Resilience Details
+
+| Behaviour | Value |
+|---|---|
+| Max retries per page | 5 |
+| Wait between retries | 120s |
+| Delay between pages | 3–6s (random) |
+| Consecutive-failure abort | 2 signs |
+| Partial-result guard | all 5 required fields must pass validation |
+| Atomic writes | `.tmp` → rename, no corrupt files on crash |
 
 ---
 
@@ -137,7 +159,7 @@ main.py (FastAPI)
 |---|---|
 | **Framework** | [FastAPI](https://fastapi.tiangolo.com/) |
 | **Scraping** | [Scrapling](https://github.com/D4Vinci/Scrapling) (stealth + adaptive XPath) |
-| **Database** | SQLite (WAL mode) |
+| **Storage** | Flat JSON files (one per sign) |
 | **Server** | Uvicorn |
 | **Timezone** | IST (`Asia/Kolkata`) via `zoneinfo` |
 | **Python** | ≥ 3.14 |
