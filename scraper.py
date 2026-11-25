@@ -108,5 +108,4 @@ def run() -> int:
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    run()
     sys.exit(1 if run() else 0)
