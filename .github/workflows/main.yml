@@ -29,7 +29,9 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Install browser
-        run: scrapling install
+        run: |
+          scrapling install
+          patchright install chromium
 
       - name: Scrape
         run: python scraper.py
